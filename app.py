@@ -17,6 +17,8 @@ if "reports" not in st.session_state:
     st.session_state.reports = []
 if "issues_draft" not in st.session_state:
     st.session_state.issues_draft = []
+if "last_venue_lab" not in st.session_state:
+    st.session_state.last_venue_lab = None
 
 def reset_draft():
     st.session_state.issues_draft = []
@@ -26,9 +28,6 @@ st.caption("POC — University of Johannesburg | Replaces manual Excel-based Dai
 
 page = st.sidebar.radio("Navigation", ["Lab Assistant", "Team Leader Dashboard"])
 
-# ============================================================
-# LAB ASSISTANT PAGE
-# ============================================================
 if page == "Lab Assistant":
     st.header("📋 Daily Lab Report")
 
@@ -38,6 +37,19 @@ if page == "Lab Assistant":
     with col2:
         lab = st.selectbox("Lab", VENUES[venue])
 
+    # BUGFIX: if the assistant changes venue/lab after logging issues, those
+    # issues belonged to the previous lab — discard them rather than silently
+    # attaching them to the newly selected one.
+    current_venue_lab = (venue, lab)
+    if st.session_state.last_venue_lab is None:
+        st.session_state.last_venue_lab = current_venue_lab
+    elif st.session_state.last_venue_lab != current_venue_lab and st.session_state.issues_draft:
+        st.session_state.issues_draft = []
+        st.session_state.last_venue_lab = current_venue_lab
+        st.warning("Venue/Lab changed — previously logged issues were cleared since they belonged to the earlier selection.")
+    else:
+        st.session_state.last_venue_lab = current_venue_lab
+
     col3, col4 = st.columns(2)
     with col3:
         staff_name = st.text_input("Technical Assistant Name")
@@ -45,6 +57,12 @@ if page == "Lab Assistant":
         report_date = st.date_input("Date", value=date.today())
 
     status = st.radio("Overall Status", ["No Issues", "Issues Identified"], horizontal=True)
+
+    # BUGFIX: if the assistant switches back to "No Issues" after logging
+    # issues, those issues would otherwise sit in the draft unseen and could
+    # leak into a later, unrelated report. Clear them and say so.
+    if status == "No Issues" and st.session_state.issues_draft:
+        st.info(f"Status is 'No Issues' — {len(st.session_state.issues_draft)} previously logged issue(s) will be discarded on submit.")
 
     if status == "Issues Identified":
         st.subheader("Log an Issue")
@@ -72,7 +90,15 @@ if page == "Lab Assistant":
 
         if st.session_state.issues_draft:
             st.write("**Issues logged so far:**")
-            st.table(pd.DataFrame(st.session_state.issues_draft))
+            draft_df = pd.DataFrame(st.session_state.issues_draft).rename(columns={
+                "equipment": "Equipment", "category": "Category",
+                "description": "Description", "notes": "Notes",
+            })
+            st.table(draft_df)
+            # BUGFIX/usability: no way to undo a wrongly-added issue before submit.
+            if st.button("🗑️ Clear logged issues"):
+                reset_draft()
+                st.rerun()
 
     st.divider()
 
@@ -88,16 +114,15 @@ if page == "Lab Assistant":
                 "staff": staff_name,
                 "date": report_date,
                 "status": status,
-                "issues": list(st.session_state.issues_draft),
+                # BUGFIX: force-empty when "No Issues" so a stale draft can
+                # never attach issues to a report that says there are none.
+                "issues": list(st.session_state.issues_draft) if status == "Issues Identified" else [],
             }
             st.session_state.reports.append(report)
             reset_draft()
             st.success(f"✅ Report submitted for {venue} – {lab} ({report_date}).")
             st.balloons()
 
-# ============================================================
-# TEAM LEADER DASHBOARD
-# ============================================================
 else:
     st.header("📊 Team Leader Dashboard")
     reports = st.session_state.reports
@@ -123,72 +148,104 @@ else:
         with f1:
             venue_filter = st.selectbox("Venue", ["All"] + list(VENUES.keys()))
         with f2:
-            lab_options = ["All"] + (VENUES[venue_filter] if venue_filter != "All" else sorted({l for labs in VENUES.values() for l in labs}))
+            # BUGFIX: LAB 203 and LAB 204 each exist in two different venues
+            # (E LES COMP and E RING COMP). Under "All" venues, plain lab
+            # codes were ambiguous and silently merged reports from two
+            # unrelated labs. Qualify duplicated codes with their venue.
+            if venue_filter != "All":
+                lab_options = ["All"] + VENUES[venue_filter]
+            else:
+                lab_counts = {}
+                for v, labs in VENUES.items():
+                    for l in labs:
+                        lab_counts[l] = lab_counts.get(l, 0) + 1
+                pairs = [(v, l) for v, labs in VENUES.items() for l in labs]
+                lab_options = ["All"] + sorted(
+                    l if lab_counts[l] == 1 else f"{l} ({v})" for v, l in pairs
+                )
             lab_filter = st.selectbox("Lab", lab_options)
         with f3:
             date_filter = st.date_input("Date", value=None)
 
+        # Resolve the (possibly venue-qualified) lab filter back to a plain lab code.
+        lab_filter_plain = lab_filter.split(" (")[0] if lab_filter != "All" else "All"
+        lab_filter_venue = None
+        if lab_filter != "All" and "(" in lab_filter:
+            lab_filter_venue = lab_filter.rstrip(")").split("(")[-1]
+
         filtered = reports
         if venue_filter != "All":
             filtered = [r for r in filtered if r["venue"] == venue_filter]
-        if lab_filter != "All":
-            filtered = [r for r in filtered if r["lab"] == lab_filter]
+        if lab_filter_plain != "All":
+            filtered = [r for r in filtered if r["lab"] == lab_filter_plain]
+            if lab_filter_venue:
+                filtered = [r for r in filtered if r["venue"] == lab_filter_venue]
         if date_filter:
             filtered = [r for r in filtered if r["date"] == date_filter]
 
         st.subheader(f"Reports ({len(filtered)})")
-        summary_df = pd.DataFrame([{
-            "Venue": r["venue"], "Lab": r["lab"], "Staff": r["staff"],
-            "Date": r["date"], "Status": r["status"], "# Issues": len(r["issues"])
-        } for r in filtered])
-        st.dataframe(summary_df, use_container_width=True)
 
-        st.divider()
-        st.subheader("📄 Report Detail & Generation")
-        idx = st.selectbox(
-            "Select a report to view",
-            range(len(filtered)),
-            format_func=lambda i: f"{filtered[i]['venue']} – {filtered[i]['lab']} – {filtered[i]['staff']} – {filtered[i]['date']}"
-        )
-        r = filtered[idx]
-
-        colA, colB = st.columns(2)
-        with colA:
-            st.write(f"**Venue:** {r['venue']}")
-            st.write(f"**Lab:** {r['lab']}")
-            st.write(f"**Staff Member:** {r['staff']}")
-        with colB:
-            st.write(f"**Date:** {r['date']}")
-            st.write(f"**Overall Status:** {r['status']}")
-
-        if r["issues"]:
-            st.write("**Issues:**")
-            st.table(pd.DataFrame(r["issues"]))
+        # BUGFIX (crash): filtering down to zero reports used to crash the
+        # detail/generate section below (selectbox with no options). Guard it.
+        if not filtered:
+            st.warning("No reports match the current filters.")
         else:
-            st.write("No issues logged.")
+            summary_df = pd.DataFrame([{
+                "Venue": r["venue"], "Lab": r["lab"], "Staff": r["staff"],
+                "Date": r["date"], "Status": r["status"], "# Issues": len(r["issues"])
+            } for r in filtered])
+            st.dataframe(summary_df, use_container_width=True)
 
-        if st.button("📝 GENERATE REPORT"):
-            lines = [
-                "LAB OPERATIONS REPORT",
-                "",
-                f"Venue: {r['venue']}",
-                f"Lab: {r['lab']}",
-                f"Date: {r['date']}",
-                f"Staff Member: {r['staff']}",
-                "",
-                f"Overall Status: {r['status']}",
-                "",
-                "Issues Identified:",
-            ]
+            st.divider()
+            st.subheader("📄 Report Detail & Generation")
+            idx = st.selectbox(
+                "Select a report to view",
+                range(len(filtered)),
+                format_func=lambda i: f"{filtered[i]['venue']} – {filtered[i]['lab']} – {filtered[i]['staff']} – {filtered[i]['date']}"
+            )
+            r = filtered[idx]
+
+            colA, colB = st.columns(2)
+            with colA:
+                st.write(f"**Venue:** {r['venue']}")
+                st.write(f"**Lab:** {r['lab']}")
+                st.write(f"**Staff Member:** {r['staff']}")
+            with colB:
+                st.write(f"**Date:** {r['date']}")
+                st.write(f"**Overall Status:** {r['status']}")
+
             if r["issues"]:
-                for i, issue in enumerate(r["issues"], 1):
-                    lines.append(f"{i}. [{issue['category']}] {issue['equipment']}: {issue['description']}" + (f" (Notes: {issue['notes']})" if issue['notes'] else ""))
+                st.write("**Issues:**")
+                issues_df = pd.DataFrame(r["issues"]).rename(columns={
+                    "equipment": "Equipment", "category": "Category",
+                    "description": "Description", "notes": "Notes",
+                })
+                st.table(issues_df)
             else:
-                lines.append("None")
-            lines += ["", "Outstanding Issues:", "..." , "", "Next Steps:", "..."]
-            report_text = "\n".join(lines)
-            st.code(report_text, language=None)
-            st.download_button("⬇️ Download Report (.txt)", report_text, file_name=f"{r['lab'].replace(' ','_')}_{r['date']}.txt")
+                st.write("No issues logged.")
+
+            if st.button("📝 GENERATE REPORT"):
+                lines = [
+                    "LAB OPERATIONS REPORT",
+                    "",
+                    f"Venue: {r['venue']}",
+                    f"Lab: {r['lab']}",
+                    f"Date: {r['date']}",
+                    f"Staff Member: {r['staff']}",
+                    "",
+                    f"Overall Status: {r['status']}",
+                    "",
+                    "Issues Identified:",
+                ]
+                if r["issues"]:
+                    for i, issue in enumerate(r["issues"], 1):
+                        lines.append(f"{i}. [{issue['category']}] {issue['equipment']}: {issue['description']}" + (f" (Notes: {issue['notes']})" if issue['notes'] else ""))
+                else:
+                    lines.append("None")
+                lines += ["", "Outstanding Issues:", "..." , "", "Next Steps:", "..."]
+                report_text = "\n".join(lines)
+                st.code(report_text, language=None)
+                st.download_button("⬇️ Download Report (.txt)", report_text, file_name=f"{r['lab'].replace(' ','_')}_{r['date']}.txt")
 
         st.divider()
         st.subheader("🚨 Venues Currently With Issues")
