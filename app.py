@@ -1,8 +1,89 @@
 import streamlit as st
 import pandas as pd
 from datetime import date
+import os
+from supabase import create_client
 
 st.set_page_config(page_title="Lab Operations Tracker", page_icon="🖥️", layout="wide")
+
+TABLE_NAME = "lab_reports"
+
+
+@st.cache_resource(show_spinner=False)
+def get_supabase_client():
+    """Build the Supabase client from environment variables.
+
+    Returns None if the app isn't configured yet, so the UI can show a
+    clear setup message instead of crashing.
+    """
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
+    if not url or not key:
+        return None
+    try:
+        return create_client(url, key)
+    except Exception:
+        return None
+
+
+def insert_report(report: dict):
+    """Persist a submitted report to Supabase.
+
+    Returns (success: bool, error_message: str | None).
+    """
+    client = get_supabase_client()
+    if client is None:
+        return False, "Database is not configured (missing SUPABASE_URL / SUPABASE_KEY)."
+
+    payload = {
+        "venue": report["venue"],
+        "lab": report["lab"],
+        "staff": report["staff"],
+        "report_date": report["date"].isoformat(),
+        "status": report["status"],
+        "issues": report["issues"],
+    }
+    try:
+        result = client.table(TABLE_NAME).insert(payload).execute()
+        if not result.data:
+            return False, "Insert returned no data — the write may not have completed."
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def fetch_reports():
+    """Load all reports from Supabase, shaped to match the app's existing
+    in-memory report dict format so the rest of the UI code needs no changes.
+
+    Returns (reports: list[dict], error_message: str | None).
+    """
+    client = get_supabase_client()
+    if client is None:
+        return [], "Database is not configured (missing SUPABASE_URL / SUPABASE_KEY)."
+
+    try:
+        result = (
+            client.table(TABLE_NAME)
+            .select("*")
+            .order("report_date", desc=True)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        reports = []
+        for row in result.data or []:
+            reports.append({
+                "venue": row["venue"],
+                "lab": row["lab"],
+                "staff": row["staff"],
+                "date": date.fromisoformat(row["report_date"]),
+                "status": row["status"],
+                "issues": row.get("issues") or [],
+            })
+        return reports, None
+    except Exception as e:
+        return [], str(e)
+
 
 VENUES = {
     "E LES COMP": ["LAB 201", "LAB 202", "LAB 203", "LAB 204"],
@@ -13,8 +94,6 @@ VENUES = {
 
 CATEGORIES = ["Computer", "Network/Internet", "Keyboard/Mouse", "Projector", "Software", "Power", "Other"]
 
-if "reports" not in st.session_state:
-    st.session_state.reports = []
 if "issues_draft" not in st.session_state:
     st.session_state.issues_draft = []
 if "last_venue_lab" not in st.session_state:
@@ -24,7 +103,13 @@ def reset_draft():
     st.session_state.issues_draft = []
 
 st.title("🖥️ Lab Operations Tracker")
-st.caption("POC — University of Johannesburg | Replaces manual Excel-based Daily Lab Maintenance Report")
+st.caption("University of Johannesburg | Replaces manual Excel-based Daily Lab Maintenance Report")
+
+if get_supabase_client() is None:
+    st.error(
+        "⚠️ Database not configured — reports cannot be saved. "
+        "Set the SUPABASE_URL and SUPABASE_KEY environment variables and restart the app."
+    )
 
 page = st.sidebar.radio("Navigation", ["Lab Assistant", "Team Leader Dashboard"])
 
@@ -118,14 +203,24 @@ if page == "Lab Assistant":
                 # never attach issues to a report that says there are none.
                 "issues": list(st.session_state.issues_draft) if status == "Issues Identified" else [],
             }
-            st.session_state.reports.append(report)
-            reset_draft()
-            st.success(f"✅ Report submitted for {venue} – {lab} ({report_date}).")
-            st.balloons()
+            with st.spinner("Saving report..."):
+                success, err = insert_report(report)
+            if success:
+                reset_draft()
+                st.success(f"✅ Report submitted and saved for {venue} – {lab} ({report_date}).")
+                st.balloons()
+            else:
+                st.error(f"❌ Failed to save report to the database: {err}")
+                st.info("Nothing was lost — your logged issues are still filled in above. Please try submitting again.")
 
 else:
     st.header("📊 Team Leader Dashboard")
-    reports = st.session_state.reports
+    with st.spinner("Loading reports..."):
+        reports, fetch_err = fetch_reports()
+
+    if fetch_err:
+        st.error(f"❌ Could not load reports from the database: {fetch_err}")
+        st.stop()
 
     total = len(reports)
     with_issues = sum(1 for r in reports if r["status"] == "Issues Identified")
